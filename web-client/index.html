@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PowDEX</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <strong>PowDEX</strong>
+    <div class="header-actions">
+      <span id="sessionBadge" class="badge muted">Disconnected</span>
+      <button id="connectBtn" type="button">Connect Zeroa</button>
+    </div>
+  </header>
+  <main>
+    <p class="muted">Path A — web client. Connect Zeroa on this device to trade with your TLS wallet.</p>
+    <div class="card">
+      <h2>Markets</h2>
+      <table id="marketsTable"><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Prices</h2>
+      <table id="pricesTable"><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Order book — BTC/TLS</h2>
+      <pre id="orderBook" class="mono muted">Loading…</pre>
+    </div>
+    <div class="card">
+      <h2>Session</h2>
+      <pre id="sessionLog" class="mono muted">Not connected</pre>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
