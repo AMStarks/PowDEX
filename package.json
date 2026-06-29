@@ -12,6 +12,7 @@
     "install-server": "npm install",
     "install-all": "npm run install-server && npm run install-client",
     "start": "node server.js",
+    "dev:no-db": "POWDEX_DEV_NO_DB=1 POWDEX_DEV_SKIP_SIG_VERIFY=1 node server.js",
     "test": "jest"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
     "sequelize": "^6.37.7",
     "sequelize-cli": "^6.6.3",
     "socket.io": "^4.7.2",
+    "secp256k1": "^5.0.1",
     "uuid": "^9.0.0",
     "ws": "^8.13.0"
   },

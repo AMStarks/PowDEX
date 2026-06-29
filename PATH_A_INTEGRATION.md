@@ -17,7 +17,7 @@ Key additions:
 3. `GET /api/bridge/auth/status/:connectionId` — web polls completion
 4. `POST /api/bridge/auth/complete` — Zeroa submits signed session
 5. `GET /api/markets` — pair list with settlement badges
-6. Static serve `client/` at `/`
+6. Static serve `web-client/` at `/`
 
 ## Local dev (monorepo)
 

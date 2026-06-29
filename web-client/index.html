@@ -16,23 +16,66 @@
   </header>
   <main>
     <p class="muted">Path A — web client. Connect Zeroa on this device to trade with your TLS wallet.</p>
+
     <div class="card">
       <h2>Markets</h2>
       <table id="marketsTable"><tbody></tbody></table>
     </div>
+
     <div class="card">
       <h2>Prices</h2>
       <table id="pricesTable"><tbody></tbody></table>
     </div>
+
     <div class="card">
       <h2>Order book — BTC/TLS</h2>
-      <pre id="orderBook" class="mono muted">Loading…</pre>
+      <div class="order-grid">
+        <div>
+          <h3>Bids</h3>
+          <table id="bidsTable"><thead><tr><th>Price</th><th>Amount</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h3>Asks</h3>
+          <table id="asksTable"><thead><tr><th>Price</th><th>Amount</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
     </div>
+
+    <div class="card">
+      <h2>Place order (BTC/TLS)</h2>
+      <form id="orderForm" class="form-row">
+        <select id="orderSide">
+          <option value="buy">Buy TLS</option>
+          <option value="sell">Sell TLS</option>
+        </select>
+        <input id="orderAmount" type="number" step="any" min="0" placeholder="Amount" required />
+        <input id="orderPrice" type="number" step="any" min="0" placeholder="Price" required />
+        <button type="submit">Submit</button>
+      </form>
+      <p id="orderStatus" class="muted mono"></p>
+    </div>
+
+    <div class="card" id="htlcCard">
+      <h2>BTC/TLS HTLC swap <span id="htlcBadge" class="badge warn">testnet scaffold</span></h2>
+      <p class="muted">Creates unsigned legs and opens Zeroa to sign each chain. Broadcast is off unless <code>POWDEX_BROADCAST_ENABLED=1</code>.</p>
+      <form id="swapForm" class="form-row">
+        <select id="swapSide">
+          <option value="buy">Buy TLS with BTC</option>
+          <option value="sell">Sell TLS for BTC</option>
+        </select>
+        <input id="swapAmount" type="number" step="any" min="0" placeholder="BTC amount" required />
+        <input id="swapPrice" type="number" step="any" min="0" placeholder="TLS/BTC price (optional)" />
+        <button type="submit" id="swapBtn">Prepare swap</button>
+      </form>
+      <pre id="swapLog" class="mono muted">Connect Zeroa to enable swaps.</pre>
+    </div>
+
     <div class="card">
       <h2>Session</h2>
       <pre id="sessionLog" class="mono muted">Not connected</pre>
     </div>
   </main>
+  <script src="/socket.io/socket.io.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

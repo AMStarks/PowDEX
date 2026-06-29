@@ -14,3 +14,8 @@ table { width: 100%; border-collapse: collapse; }
 td, th { text-align: left; padding: 0.5rem 0; border-bottom: 1px solid #1f2a3d; }
 .muted { color: #93a0b8; font-size: 0.9rem; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; }
+.form-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+.form-row input, .form-row select { background: #0b0f17; border: 1px solid #1f2a3d; color: #e8edf7; border-radius: 8px; padding: 0.5rem 0.65rem; min-width: 120px; }
+.order-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.order-grid h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: #93a0b8; }
+code { background: #0b0f17; padding: 0.1rem 0.35rem; border-radius: 4px; }

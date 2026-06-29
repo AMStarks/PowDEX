@@ -1,3 +1,4 @@
+const path = require('path');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -16,6 +17,9 @@ require('dotenv').config();
 const db = require('./models');
 const DatabaseService = require('./services/DatabaseService');
 const PriceFeedService = require('./services/PriceFeedService');
+const BridgeSignatureService = require('./services/BridgeSignatureService');
+const BridgeReplayStore = require('./services/BridgeReplayStore');
+const HTLCService = require('./services/HTLCService');
 
 const app = express();
 const server = http.createServer(app);
@@ -57,8 +61,13 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Initialize database
 let dbInitialized = false;
+const devNoDb = process.env.POWDEX_DEV_NO_DB === '1';
 
 async function initializeDatabase() {
+  if (devNoDb) {
+    console.warn('⚠️ POWDEX_DEV_NO_DB=1 — running without PostgreSQL (bridge + static only)');
+    return;
+  }
   try {
     await DatabaseService.initialize();
     await db.sequelize.sync({ alter: true });
@@ -75,6 +84,28 @@ initializeDatabase();
 
 // Supported cryptocurrencies
 const SUPPORTED_COINS = ['BTC', 'LTC', 'TLS', 'USDT', 'USDC'];
+
+const MARKET_PAIRS = [
+  { pair: 'BTC/TLS', settlement: 'pre-settlement', label: 'BTC/TLS (foundation)' },
+  { pair: 'BTC/USDT', settlement: 'price-only', label: 'BTC/USDT (oracle)' },
+  { pair: 'BTC/USDC', settlement: 'price-only', label: 'BTC/USDC (oracle)' },
+  { pair: 'LTC/USDT', settlement: 'price-only', label: 'LTC/USDT (oracle)' },
+  { pair: 'LTC/USDC', settlement: 'price-only', label: 'LTC/USDC (oracle)' },
+  { pair: 'TLS/USDT', settlement: 'price-only', label: 'TLS/USDT (oracle)' },
+  { pair: 'TLS/USDC', settlement: 'price-only', label: 'TLS/USDC (oracle)' },
+  { pair: 'BTC/LTC', settlement: 'price-only', label: 'BTC/LTC (oracle)' },
+  { pair: 'LTC/TLS', settlement: 'price-only', label: 'LTC/TLS (oracle)' }
+];
+
+const ORDER_MATCH_PAIRS = [
+  'BTC/TLS',
+  'BTC/USDT',
+  'BTC/USDC',
+  'LTC/USDT',
+  'LTC/USDC',
+  'TLS/USDT',
+  'TLS/USDC'
+];
 
 // Mock price data (will be replaced with real price feeds)
 let currentPrices = {
@@ -235,6 +266,13 @@ class OrderManager {
         remainingAmount: parseFloat(amount)
       };
 
+      if (devNoDb) {
+        const order = { id: uuidv4(), ...orderData, createdAt: Date.now() };
+        await this.addToOrderBook(order);
+        io.emit('orderBookUpdate', { pair });
+        return { success: true, order };
+      }
+
       const order = await DatabaseService.createOrder(orderData);
       
       // Add to order book
@@ -293,6 +331,10 @@ class OrderManager {
   }
 
   async getOrderBook(pair) {
+    if (devNoDb) {
+      const book = this.orderBook.get(pair) || { buys: [], sells: [] };
+      return { buyOrders: book.buys, sellOrders: book.sells };
+    }
     try {
       return await DatabaseService.getOrderBook(pair);
     } catch (error) {
@@ -393,13 +435,384 @@ const walletConnector = new WalletConnector();
 const orderManager = new OrderManager();
 const swapManager = new AtomicSwapManager();
 
+// Bridge session + sign request stores (Path A foundation)
+const bridgeSessions = new Map();
+const usedBridgeNonces = new Set();
+const bridgeSignRequests = new Map();
+const pendingAuthConnections = new Map();
+
+function purgeExpiredAuthConnections() {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [id, conn] of pendingAuthConnections.entries()) {
+    if (conn.expiresAt < now) {
+      pendingAuthConnections.delete(id);
+    }
+  }
+}
+
+class BridgeSessionManager {
+  verifyAndCreateSession(payload) {
+    const {
+      tlsAddress,
+      sessionToken,
+      nonce,
+      timestamp,
+      expiresAt,
+      permissions,
+      signature,
+      zeroaPubKey
+    } = payload;
+
+    if (!tlsAddress || !sessionToken || !nonce || !signature || !zeroaPubKey) {
+      return { success: false, error: 'Missing required fields' };
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (expiresAt && now > expiresAt) {
+      return { success: false, error: 'Session envelope expired' };
+    }
+
+    if (!BridgeReplayStore.consumeNonce(sessionToken, nonce)) {
+      return { success: false, error: 'Replay detected' };
+    }
+
+    const verification = BridgeSignatureService.verifyAuthEnvelope(payload);
+    if (!verification.valid) {
+      return { success: false, error: verification.error || 'Invalid signature' };
+    }
+
+    const bridgeSessionId = uuidv4();
+    const bridgeJwt = jwtSignBridgeSession({ bridgeSessionId, tlsAddress, permissions, expiresAt });
+    const session = {
+      bridgeSessionId,
+      tlsAddress,
+      sessionToken,
+      permissions: permissions || [],
+      expiresAt,
+      zeroaPubKey,
+      createdAt: now
+    };
+    bridgeSessions.set(bridgeSessionId, session);
+
+    return {
+      success: true,
+      bridgeSessionId,
+      jwt: bridgeJwt,
+      expiresAt,
+      permissions: session.permissions,
+      warning: verification.warning || null
+    };
+  }
+}
+
+function jwtSignBridgeSession({ bridgeSessionId, tlsAddress, permissions, expiresAt }) {
+  return jwt.sign(
+    { bridgeSessionId, tlsAddress, permissions },
+    process.env.JWT_SECRET || 'powdex-dev-secret',
+    { expiresIn: expiresAt ? Math.max(expiresAt - Math.floor(Date.now() / 1000), 60) : '1h' }
+  );
+}
+
+const bridgeSessionManager = new BridgeSessionManager();
+
 // API Routes
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     database: dbInitialized ? 'connected' : 'disconnected',
-    version: '1.0.0'
+    version: '1.0.0',
+    bridgeVersion: 'powdex-bridge-v1'
+  });
+});
+
+app.get('/api/markets', (req, res) => {
+  res.json({
+    markets: MARKET_PAIRS,
+    supportedCoins: SUPPORTED_COINS
+  });
+});
+
+// Bridge session verification (Path A)
+app.post('/api/bridge/session/verify', (req, res) => {
+  try {
+    const result = bridgeSessionManager.verifyAndCreateSession(req.body);
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Error verifying bridge session:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Web bridge auth relay (browser cannot access iOS App Groups)
+app.post('/api/bridge/auth/init', (req, res) => {
+  purgeExpiredAuthConnections();
+  const connectionId = uuidv4();
+  const nonce = SecurityManager.generateNonce();
+  const expiresAt = Math.floor(Date.now() / 1000) + 300;
+  const permissions = req.body?.permissions || ['dex.read', 'dex.trade', 'dex.sign.swap'];
+
+  pendingAuthConnections.set(connectionId, {
+    status: 'pending',
+    nonce,
+    permissions,
+    expiresAt,
+    createdAt: Date.now()
+  });
+
+  res.json({ connectionId, nonce, expiresAt, permissions });
+});
+
+app.get('/api/bridge/auth/request/:connectionId', (req, res) => {
+  purgeExpiredAuthConnections();
+  const conn = pendingAuthConnections.get(req.params.connectionId);
+  if (!conn) {
+    return res.status(404).json({ error: 'Connection not found' });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (conn.expiresAt < now) {
+    conn.status = 'expired';
+    return res.status(410).json({ error: 'Connection expired' });
+  }
+  res.json({
+    connectionId: req.params.connectionId,
+    nonce: conn.nonce,
+    permissions: conn.permissions,
+    expiresAt: conn.expiresAt
+  });
+});
+
+app.get('/api/bridge/auth/status/:connectionId', (req, res) => {
+  purgeExpiredAuthConnections();
+  const conn = pendingAuthConnections.get(req.params.connectionId);
+  if (!conn) {
+    return res.status(404).json({ error: 'Connection not found' });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (conn.expiresAt < now && conn.status === 'pending') {
+    conn.status = 'expired';
+  }
+  res.json({
+    status: conn.status,
+    session: conn.session || null
+  });
+});
+
+app.post('/api/bridge/auth/complete', (req, res) => {
+  try {
+    const { connectionId, ...sessionPayload } = req.body;
+    if (!connectionId) {
+      return res.status(400).json({ error: 'connectionId required' });
+    }
+    const conn = pendingAuthConnections.get(connectionId);
+    if (!conn) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+    if (conn.nonce && sessionPayload.nonce !== conn.nonce) {
+      return res.status(400).json({ error: 'Nonce mismatch' });
+    }
+
+    const result = bridgeSessionManager.verifyAndCreateSession(sessionPayload);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+
+    conn.status = 'completed';
+    conn.session = {
+      bridgeSessionId: result.bridgeSessionId,
+      jwt: result.jwt,
+      tlsAddress: sessionPayload.tlsAddress,
+      expiresAt: result.expiresAt,
+      permissions: result.permissions
+    };
+
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Error completing bridge auth:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Bridge sign requests (Path A foundation — no broadcast)
+app.post('/api/bridge/sign-requests', (req, res) => {
+  try {
+    const { bridgeSessionId, pair, chain, intent, unsignedTx, txMeta } = req.body;
+    if (!bridgeSessionId || !chain || !intent || !unsignedTx) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const session = bridgeSessions.get(bridgeSessionId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid bridge session' });
+    }
+
+    const requestId = uuidv4();
+    const expiresAt = Math.floor(Date.now() / 1000) + 120;
+    const record = {
+      requestId,
+      bridgeSessionId,
+      sessionToken: session.sessionToken,
+      pair: pair || 'BTC/TLS',
+      chain,
+      intent,
+      unsignedTx,
+      txMeta: txMeta || {},
+      status: 'pending',
+      nonce: requestId,
+      timestamp: Math.floor(Date.now() / 1000),
+      expiresAt,
+      createdAt: Date.now()
+    };
+    bridgeSignRequests.set(requestId, record);
+    io.emit('bridgeSignRequestCreated', {
+      requestId,
+      pair: record.pair,
+      chain,
+      intent,
+      expiresAt
+    });
+    res.json({ requestId, expiresAt, status: 'pending' });
+  } catch (error) {
+    console.error('Error creating bridge sign request:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/bridge/sign-requests/:requestId/submit', (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { signedTx, signature, txid, timestamp } = req.body;
+    const record = bridgeSignRequests.get(requestId);
+    if (!record) {
+      return res.status(404).json({ error: 'Sign request not found' });
+    }
+
+    record.status = 'submitted';
+    record.signedTx = signedTx;
+    record.signature = signature;
+    record.txid = txid || null;
+    record.submittedAt = timestamp || Date.now();
+    bridgeSignRequests.set(requestId, record);
+
+    io.emit('bridgeSignRequestUpdated', {
+      requestId,
+      status: record.status,
+      txid: record.txid
+    });
+
+    res.json({ success: true, requestId, status: record.status });
+  } catch (error) {
+    console.error('Error submitting bridge sign request:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/bridge/sign-requests/:requestId', (req, res) => {
+  const record = bridgeSignRequests.get(req.params.requestId);
+  if (!record) {
+    return res.status(404).json({ error: 'Sign request not found' });
+  }
+  res.json({
+    requestId: record.requestId,
+    status: record.status,
+    error: record.error || null,
+    sessionToken: record.sessionToken || null,
+    chain: record.chain,
+    intent: record.intent,
+    pair: record.pair,
+    unsignedTx: record.unsignedTx,
+    txMeta: record.txMeta || {},
+    nonce: record.nonce || record.requestId,
+    timestamp: record.timestamp || null,
+    expiresAt: record.expiresAt
+  });
+});
+
+// HTLC testnet swap orchestration (feature-flagged)
+app.post('/api/htlc/swaps', (req, res) => {
+  try {
+    const { bridgeSessionId, pair, side, amount, price } = req.body;
+    const session = bridgeSessions.get(bridgeSessionId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid bridge session' });
+    }
+    const result = HTLCService.createSwap({
+      bridgeSessionId,
+      pair: pair || 'BTC/TLS',
+      side,
+      amount,
+      price,
+      tlsAddress: session.tlsAddress
+    });
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+
+    const swap = result.swap;
+    const attachSignRequest = (chain, unsignedTx, intent) => {
+      const requestId = uuidv4();
+      const expiresAt = Math.floor(Date.now() / 1000) + 300;
+      bridgeSignRequests.set(requestId, {
+        requestId,
+        bridgeSessionId,
+        sessionToken: session.sessionToken,
+        pair: swap.pair,
+        chain,
+        intent,
+        unsignedTx,
+        txMeta: { swapId: swap.swapId },
+        status: 'pending',
+        nonce: requestId,
+        timestamp: Math.floor(Date.now() / 1000),
+        expiresAt,
+        createdAt: Date.now()
+      });
+      return requestId;
+    };
+
+    const enriched = HTLCService.updateSwap(swap.swapId, {
+      btcSignRequestId: attachSignRequest('BTC', swap.btcUnsignedTx, 'swap_funding'),
+      tlsSignRequestId: attachSignRequest('TLS', swap.tlsUnsignedTx, 'swap_funding')
+    });
+
+    res.json(enriched || swap);
+  } catch (error) {
+    console.error('Error creating HTLC swap:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/htlc/swaps/:swapId', (req, res) => {
+  const swap = HTLCService.getSwap(req.params.swapId);
+  if (!swap) {
+    return res.status(404).json({ error: 'Swap not found' });
+  }
+  res.json(swap);
+});
+
+app.post('/api/htlc/swaps/:swapId/submit', (req, res) => {
+  try {
+    const { chain, signedTx, txid } = req.body;
+    const result = HTLCService.submitSignedLeg(req.params.swapId, chain, signedTx, txid);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result.swap);
+  } catch (error) {
+    console.error('Error submitting HTLC leg:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/htlc/status', (req, res) => {
+  res.json({
+    enabled: HTLCService.isEnabled(),
+    testnetOnly: process.env.POWDEX_MAINNET_HTLC !== '1',
+    broadcastEnabled: process.env.POWDEX_BROADCAST_ENABLED === '1'
   });
 });
 
@@ -598,7 +1011,7 @@ cron.schedule('*/10 * * * * *', async () => {
   if (!dbInitialized) return;
 
   try {
-    const pairs = ['BTC/USDT', 'BTC/USDC', 'LTC/USDT', 'LTC/USDC', 'TLS/USDT', 'TLS/USDC'];
+    const pairs = ORDER_MATCH_PAIRS;
     
     for (const pair of pairs) {
       const orderBook = await orderManager.getOrderBook(pair);
@@ -632,7 +1045,15 @@ cron.schedule('*/10 * * * * *', async () => {
   }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5050;
+
+// Static web client (after API routes)
+const clientDir = path.join(__dirname, 'web-client');
+app.get('/', (req, res) => {
+  res.sendFile(path.join(clientDir, 'index.html'));
+});
+app.use(express.static(clientDir));
+
 server.listen(PORT, () => {
   console.log(`🚀 PowDEX server running on port ${PORT}`);
   console.log(`📊 Database: ${dbInitialized ? 'Connected' : 'Connecting...'}`);
